@@ -216,6 +216,14 @@ async def agent_loop(session: Session, user_message: str) -> str:
 
         # 异步调用 LLM
         request_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+        logger.info(
+            f"[LLM请求] 会话={session.conversation_id} | 轮次={rounds+1} | "
+            f"模型={MODEL} | 消息数={len(request_messages)} | "
+            f"工具数={len(openai_tools)} | "
+            f"用户消息={user_message[:100]}"
+        )
+        import time as _time
+        _llm_start = _time.time()
         try:
             resp = await llm_client.chat.completions.create(
                 model=MODEL,
@@ -223,13 +231,23 @@ async def agent_loop(session: Session, user_message: str) -> str:
                 tools=openai_tools,
                 tool_choice="auto",
                 max_tokens=4000,
-                timeout=20.0,  # 缩短至 20 秒超时，方便快速重试
+                timeout=120.0,  # 云托管环境需要更长超时（网络延迟 + 模型推理时间）
+            )
+            _llm_cost = round(_time.time() - _llm_start, 2)
+            logger.info(
+                f"[LLM响应] 耗时={_llm_cost}s | "
+                f"finish_reason={resp.choices[0].finish_reason} | "
+                f"tokens={getattr(resp.usage, 'total_tokens', '?') if resp.usage else '?'} | "
+                f"prompt_tokens={getattr(resp.usage, 'prompt_tokens', '?') if resp.usage else '?'} | "
+                f"completion_tokens={getattr(resp.usage, 'completion_tokens', '?') if resp.usage else '?'}"
             )
         except asyncio.TimeoutError:
-            logger.error("大模型请求超时")
+            _llm_cost = round(_time.time() - _llm_start, 2)
+            logger.error(f"[LLM超时] 耗时={_llm_cost}s | 模型={MODEL}")
             return "抱歉，智能助理服务请求大模型超时，请稍后重试。"
         except Exception as e:
-            logger.error(f"大模型请求异常: {e}")
+            _llm_cost = round(_time.time() - _llm_start, 2)
+            logger.error(f"[LLM异常] 耗时={_llm_cost}s | 模型={MODEL} | 错误={e}")
             return "抱歉，智能助理服务请求大模型异常，请稍后重试。"
 
         rounds += 1
@@ -293,6 +311,13 @@ async def agent_loop(session: Session, user_message: str) -> str:
                             
         if tool_calls:
             entry["tool_calls"] = tool_calls
+            tool_names = [tc["function"]["name"] for tc in tool_calls]
+            logger.info(f"[LLM工具调用] 调用工具: {tool_names}")
+            for tc in tool_calls:
+                logger.info(f"  ├─ {tc['function']['name']}({tc['function']['arguments'][:300]})")
+        else:
+            reply_preview = (assistant_msg.content or '')[:200]
+            logger.info(f"[LLM最终回复] 预览: {reply_preview}")
             
         messages.append(entry)
 
@@ -336,9 +361,11 @@ async def agent_loop(session: Session, user_message: str) -> str:
                 continue
 
             # 读操作或已被确认的写操作正常执行
-            logger.info(f"  工具调用: {tool_name}({json.dumps(args, ensure_ascii=False)[:200]})")
+            logger.info(f"[工具执行] {tool_name} | 参数: {json.dumps(args, ensure_ascii=False)[:300]}")
+            _tool_start = _time.time()
             output = await registry.execute(tool_name, args, token)
-            logger.info(f"  工具结果: {output[:200]}")
+            _tool_cost = round(_time.time() - _tool_start, 2)
+            logger.info(f"[工具结果] {tool_name} | 耗时={_tool_cost}s | 结果: {output[:500]}")
 
             messages.append({
                 "role": "tool",
