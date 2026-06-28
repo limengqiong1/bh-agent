@@ -13,6 +13,7 @@ from core.session import (
 from core.agent import agent_loop
 
 # 导入 tools 包，触发所有业务工具函数的注册器修饰与载入
+import tools
 
 
 async def expired_sessions_cleaner_loop():
