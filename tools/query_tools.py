@@ -128,15 +128,20 @@ async def tool_get_merchant_ledgers(args: dict, token: str):
 
 @registry.register(
     name="get_all_recharges",
-    description="管理员查看所有充值记录。可按商户、业务员、状态过滤。",
+    description=(
+        "管理员查看全平台所有充值记录，支持按商户、业务员、状态过滤，支持分页。"
+        "【重要】当需要跨商户统计或排行（例如：充值金额最高的商户、各商户充值汇总、全平台充值总额）时，"
+        "必须优先使用此工具一次性获取全量数据，严禁对每个商户单独调用 get_merchant_recharges。"
+        "如需全量数据用于统计，请设置 limit=1000。"
+    ),
     input_schema={
         "type": "object",
         "properties": {
             "merchant_id": {"type": "integer", "description": "可选，按商户过滤"},
             "salesman_user_id": {"type": "integer", "description": "可选，按业务员过滤"},
             "status": {"type": "string", "description": "可选，按状态过滤：pending/approved/rejected"},
-            "offset": {"type": "integer"},
-            "limit": {"type": "integer"},
+            "offset": {"type": "integer", "description": "偏移量，默认0"},
+            "limit": {"type": "integer", "description": "每页限制数，默认20。需要全量统计时请设置为1000"},
         },
     },
     is_core=True, is_write=False
@@ -150,7 +155,12 @@ async def tool_get_all_recharges(args: dict, token: str):
 
 @registry.register(
     name="get_all_orders",
-    description="管理员查看所有订单。可按商户、业务员、状态过滤。",
+    description=(
+        "管理员查看全平台所有订单，支持按商户、业务员、状态过滤，支持分页。"
+        "【重要】当需要跨商户统计或排行（例如：销售额最高的商户、各商户订单汇总、全平台销售总额）时，"
+        "必须优先使用此工具一次性获取全量数据，严禁对每个商户单独调用 get_merchant_orders。"
+        "如需全量数据用于统计，请设置 limit=1000。"
+    ),
     input_schema={
         "type": "object",
         "properties": {

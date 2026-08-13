@@ -1,5 +1,6 @@
 import uuid
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
@@ -15,6 +16,24 @@ from core.agent import agent_loop
 # 导入 tools 包，触发所有业务工具函数的注册器修饰与载入
 import tools
 
+# 异步任务状态存储：task_id -> {status, reply, conversation_id, created_at}
+# status: 'processing' | 'done' | 'error'
+tasks: dict = {}
+
+
+async def run_agent_task(task_id: str, session, message: str):
+    """后台执行 agent_loop，完成后将结果写入 tasks 字典"""
+    try:
+        reply = await agent_loop(session, message)
+        await save_session_to_disk(session)
+        tasks[task_id]["status"] = "done"
+        tasks[task_id]["reply"] = reply
+        logger.info(f"[任务完成] task_id={task_id}")
+    except Exception as e:
+        logger.error(f"[任务异常] task_id={task_id} | 错误={e}", exc_info=True)
+        tasks[task_id]["status"] = "error"
+        tasks[task_id]["reply"] = "抱歉，智能助理处理异常，请稍后重试。"
+
 
 async def expired_sessions_cleaner_loop():
     """后台定时会话清理任务"""
@@ -22,8 +41,16 @@ async def expired_sessions_cleaner_loop():
     while True:
         try:
             cleanup_expired_sessions()
+            # 清理超过 30 分钟的已完成任务
+            now = time.time()
+            expired = [tid for tid, t in tasks.items()
+                       if t["status"] != "processing" and now - t["created_at"] > 1800]
+            for tid in expired:
+                del tasks[tid]
+            if expired:
+                logger.info(f"清理过期任务 {len(expired)} 个")
         except Exception as e:
-            logger.error(f"定时清理过期会话后台任务异常: {e}")
+            logger.error(f"定时清理后台任务异常: {e}")
         await asyncio.sleep(600)  # 每10分钟清理一次
 
 
@@ -57,8 +84,8 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """返回给小程序的响应"""
-    reply: str                            # 智能体回复
+    """异步任务响应：立即返回 task_id，小程序用它来轮询结果"""
+    task_id: str                          # 任务ID，用于轮询
     conversation_id: str                  # 会话ID，小程序需要保存用于续聊
 
 
@@ -70,29 +97,53 @@ class ClearRequest(BaseModel):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, x_header_token: str = Header(...)):
     """
-    管理员智能体聊天接口
+    管理员智能体聊天接口（异步模式）
 
     Header: X-Header-Token: <管理员JWT>
     Body: { "message": "帮我查一下余额", "conversation_id": "xxx" }
+    立即返回 task_id，通过 GET /task/{task_id} 轮询结果
     """
     user_token = x_header_token.strip()
 
     # 生成或使用已有会话ID
     conversation_id = req.conversation_id or str(uuid.uuid4())
 
-    # 获取会话 (async call)
+    # 获取会话
     session = await get_or_create_session(conversation_id, user_token)
 
-    # 使用会话级别的并发锁，防止同一会话的并发消息导致上下文混乱
-    async with session.lock:
-        try:
-            reply = await agent_loop(session, req.message)
-            await save_session_to_disk(session)  # 保存对话历史到磁盘 (async call)
-        except Exception as e:
-            logger.error(f"agent_loop 异常: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="智能体处理异常，请稍后重试")
+    # 生成任务ID，立即写入任务状态
+    task_id = str(uuid.uuid4())
+    tasks[task_id] = {
+        "status": "processing",
+        "reply": None,
+        "conversation_id": conversation_id,
+        "created_at": time.time(),
+    }
+    logger.info(f"[任务创建] task_id={task_id} | conversation_id={conversation_id} | message={req.message[:50]}")
 
-    return ChatResponse(reply=reply, conversation_id=conversation_id)
+    # 后台异步执行，不阻塞当前请求
+    async def _run():
+        async with session.lock:
+            await run_agent_task(task_id, session, req.message)
+
+    asyncio.create_task(_run())
+
+    # 立即返回，< 1秒，不超时
+    return ChatResponse(task_id=task_id, conversation_id=conversation_id)
+
+
+@app.get("/task/{task_id}")
+async def get_task(task_id: str):
+    """轮询任务结果"""
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    return {
+        "task_id": task_id,
+        "status": task["status"],          # processing / done / error
+        "reply": task["reply"],            # 完成后才有值
+        "conversation_id": task["conversation_id"],
+    }
 
 
 @app.post("/clear")
